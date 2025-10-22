@@ -139,7 +139,7 @@ where
         Ok(())
     }
 
-    /// Asynchronously sets the max capacity for this cache.
+    /// Asynchronously (Immediately return) sets the max capacity for this cache.
     pub fn set_max_capacity_async(&self, new_capacity: u64) -> Result<(), CapacityError> {
         // 更新总容量
         self.inner.desired_capacity.store(Some(new_capacity));
