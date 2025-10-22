@@ -1583,6 +1583,9 @@ where
                         &mut eviction_state.counters,
                     );
                 }
+                Ok(WriteOp::SetCapacity { new_capacity: _ }) => {
+                    todo!()
+                }
                 Err(_) => break,
             };
         }
