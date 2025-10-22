@@ -126,7 +126,7 @@ impl<K, V, S> BaseCache<K, V, S> {
     /// 
     /// # Errors
     /// Returns an error if the operation fails to send to the internal channel.
-    pub(crate) fn set_max_capacity(&self, new_capacity: u64) -> Result<(), CapacityError>
+    pub(crate) fn set_max_capacity_block(&self, new_capacity: u64) -> Result<(), CapacityError>
     where
         K: Hash + Eq + Send + Sync + 'static,
         V: Clone + Send + Sync + 'static,
@@ -154,6 +154,28 @@ impl<K, V, S> BaseCache<K, V, S> {
 
         Ok(())
     }
+
+    pub(crate) fn set_max_capacity_async(&self, new_capacity: u64) -> Result<(), CapacityError>
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        use CapacityError::*;
+
+        let op = WriteOp::SetCapacity { new_capacity };
+        
+        // Try to send the operation to the write operation channel
+        self.write_op_ch
+            .try_send(op)
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ChannelError,
+                TrySendError::Disconnected(_) => CacheDropped,
+            })?;
+
+        Ok(())
+    }
+    
 }
 
 impl<K, V, S> BaseCache<K, V, S>

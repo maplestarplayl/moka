@@ -801,8 +801,14 @@ where
     /// ```
     ///
     /// [`CapacityError`]: ../enum.CapacityError.html
-    pub fn set_max_capacity(&self, new_capacity: u64) -> Result<(), crate::common::error::CapacityError> {
-        self.base.set_max_capacity(new_capacity)
+    pub fn set_max_capacity_block(&self, new_capacity: u64) -> Result<(), crate::common::error::CapacityError> {
+        self.base.set_max_capacity_block(new_capacity)
+    }
+
+    /// Asynchronously sets the max capacity for this cache.
+    /// For more details, see the documentation of [`set_max_capacity_block`](#method.set_max_capacity_block).
+    pub fn set_max_capacity_async(&self, new_capacity: u64) -> Result<(), crate::common::error::CapacityError> {
+        self.base.set_max_capacity_async(new_capacity)
     }
 
     /// Returns `true` if the cache contains a value for the key.

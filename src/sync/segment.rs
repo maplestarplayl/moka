@@ -124,7 +124,8 @@ where
         CacheBuilder::default().segments(num_segments)
     }
 
-    pub fn set_max_capacity(&self, new_capacity: u64) -> Result<(), CapacityError> {
+    /// Sets the max capacity for this cache.
+    pub fn set_max_capacity_block(&self, new_capacity: u64) -> Result<(), CapacityError> {
         // 更新总容量
         self.inner.desired_capacity.store(Some(new_capacity));
 
@@ -132,11 +133,27 @@ where
         let segment_capacity = new_capacity / self.inner.segments.len() as u64;
         
         for segment in &self.inner.segments {
-            segment.base.set_max_capacity(segment_capacity)?;
+            segment.base.set_max_capacity_block(segment_capacity)?;
         }
         
         Ok(())
     }
+
+    /// Asynchronously sets the max capacity for this cache.
+    pub fn set_max_capacity_async(&self, new_capacity: u64) -> Result<(), CapacityError> {
+        // 更新总容量
+        self.inner.desired_capacity.store(Some(new_capacity));
+
+        // 为每个 segment 分配容量
+        let segment_capacity = new_capacity / self.inner.segments.len() as u64;
+
+        for segment in &self.inner.segments {
+            segment.base.set_max_capacity_async(segment_capacity)?;
+        }
+
+        Ok(())
+    }
+
 }
 
 impl<K, V, S> SegmentedCache<K, V, S> {
