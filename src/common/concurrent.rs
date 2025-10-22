@@ -308,6 +308,9 @@ pub(crate) enum WriteOp<K, V> {
         kv_entry: KvEntry<K, V>,
         entry_gen: u16,
     },
+    SetCapacity {
+        new_capacity: u64,
+    },
 }
 
 /// Cloning a `WriteOp` is safe and cheap because it uses `Arc` and `MiniArc` pointers to
@@ -335,6 +338,9 @@ impl<K, V> Clone for WriteOp<K, V> {
                 kv_entry: kv_entry.clone(),
                 entry_gen: *entry_gen,
             },
+            Self::SetCapacity { new_capacity } => Self::SetCapacity {
+                new_capacity: *new_capacity,
+            },
         }
     }
 }
@@ -344,6 +350,10 @@ impl<K, V> fmt::Debug for WriteOp<K, V> {
         match self {
             Self::Upsert { .. } => f.debug_struct("Upsert").finish(),
             Self::Remove { .. } => f.debug_tuple("Remove").finish(),
+            Self::SetCapacity { new_capacity } => f
+                .debug_struct("SetCapacity")
+                .field("new_capacity", new_capacity)
+                .finish(),
         }
     }
 }

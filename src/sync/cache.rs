@@ -760,6 +760,51 @@ where
         }
     }
 
+    /// Sets the max capacity for this cache.
+    ///
+    /// # Behavior
+    /// - **Increasing capacity**: Takes effect immediately without triggering eviction.
+    /// - **Decreasing capacity**: Triggers eviction operations until the cache size
+    ///   meets the new capacity limit.
+    ///
+    /// # Notes
+    /// - When decreasing capacity, this method will block until eviction completes.
+    /// - If an eviction listener is set, it will be called for each evicted entry.
+    ///
+    /// # Errors
+    /// Returns a [`CapacityError`] if:
+    /// - The cache has been dropped (`CacheDropped`)
+    /// - The internal channel is full (`ChannelError`)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use moka::sync::Cache;
+    ///
+    /// let cache: Cache<String, String> = Cache::new(100);
+    ///
+    /// // Insert some entries
+    /// for i in 0..50 {
+    ///     cache.insert(format!("key-{}", i), format!("value-{}", i));
+    /// }
+    ///
+    /// // Increase capacity
+    /// cache.set_max_capacity(200).unwrap();
+    /// assert_eq!(cache.policy().max_capacity(), Some(200));
+    ///
+    /// // Decrease capacity - this will trigger eviction
+    /// cache.set_max_capacity(30).unwrap();
+    /// cache.run_pending_tasks();
+    /// 
+    /// // The cache should have evicted entries to meet the new capacity
+    /// assert!(cache.entry_count() <= 30);
+    /// ```
+    ///
+    /// [`CapacityError`]: ../enum.CapacityError.html
+    pub fn set_max_capacity(&self, new_capacity: u64) -> Result<(), crate::common::error::CapacityError> {
+        self.base.set_max_capacity(new_capacity)
+    }
+
     /// Returns `true` if the cache contains a value for the key.
     ///
     /// Unlike the `get` method, this method is not considered a cache read operation,

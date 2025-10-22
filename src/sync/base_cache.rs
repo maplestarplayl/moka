@@ -19,6 +19,7 @@ use crate::{
             WriteOp,
         },
         deque::{DeqNode, Deque},
+        error::CapacityError,
         frequency_sketch::FrequencySketch,
         iter::ScanningGet,
         time::{AtomicInstant, Clock, Instant},
@@ -96,7 +97,7 @@ impl<K, V, S> BaseCache<K, V, S> {
     }
 
     pub(crate) fn is_map_disabled(&self) -> bool {
-        self.inner.max_capacity == Some(0)
+        *self.inner.max_capacity.read() == Some(0)
     }
 
     #[inline]
@@ -115,6 +116,43 @@ impl<K, V, S> BaseCache<K, V, S> {
         V: Clone + Send + Sync + 'static,
     {
         self.inner.notify_invalidate(key, entry);
+    }
+
+    /// Sets the max capacity for this cache.
+    /// 
+    /// # Behavior
+    /// - Increasing capacity: Takes effect immediately without triggering eviction.
+    /// - Decreasing capacity: Triggers eviction until the cache size meets the new limit.
+    /// 
+    /// # Errors
+    /// Returns an error if the operation fails to send to the internal channel.
+    pub(crate) fn set_max_capacity(&self, new_capacity: u64) -> Result<(), CapacityError>
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        use CapacityError::*;
+
+        let op = WriteOp::SetCapacity { new_capacity };
+        
+        // Try to send the operation to the write operation channel
+        self.write_op_ch
+            .try_send(op)
+            .map_err(|e| match e {
+                TrySendError::Full(_) => ChannelError,
+                TrySendError::Disconnected(_) => CacheDropped,
+            })?;
+
+        // Run pending tasks to apply the capacity change
+        // Use housekeeper if available, otherwise call inner's run_pending_tasks directly
+        if let Some(hk) = &self.housekeeper {
+            hk.try_run_pending_tasks(&*self.inner);
+        } else {
+            self.inner.run_pending_tasks(None, 1, 10);
+        }
+
+        Ok(())
     }
 }
 
@@ -854,7 +892,7 @@ type CacheStore<K, V, S> = crate::cht::SegmentedHashMap<Arc<K>, MiniArc<ValueEnt
 
 pub(crate) struct Inner<K, V, S> {
     name: Option<String>,
-    max_capacity: Option<u64>,
+    pub(crate) max_capacity: RwLock<Option<u64>>,
     entry_count: AtomicCell<u64>,
     weighted_size: AtomicCell<u64>,
     pub(crate) cache: CacheStore<K, V, S>,
@@ -901,7 +939,7 @@ impl<K, V, S> Inner<K, V, S> {
 
     fn policy(&self) -> Policy {
         let exp = &self.expiration_policy;
-        Policy::new(self.max_capacity, 1, exp.time_to_live(), exp.time_to_idle())
+        Policy::new(self.max_capacity.read().clone(), 1, exp.time_to_live(), exp.time_to_idle())
     }
 
     #[inline]
@@ -1035,7 +1073,7 @@ where
 
         Self {
             name,
-            max_capacity,
+            max_capacity: RwLock::new(max_capacity),
             entry_count: AtomicCell::default(),
             weighted_size: AtomicCell::default(),
             cache,
@@ -1169,7 +1207,7 @@ where
         max_log_sync_repeats: u32,
         eviction_batch_size: u32,
     ) -> bool {
-        if self.max_capacity == Some(0) {
+        if *self.max_capacity.read() == Some(0) {
             return false;
         }
 
@@ -1313,20 +1351,20 @@ where
     S: BuildHasher + Clone + Send + Sync + 'static,
 {
     fn has_enough_capacity(&self, candidate_weight: u32, counters: &EvictionCounters) -> bool {
-        self.max_capacity.map_or(true, |limit| {
+        self.max_capacity.read().map_or(true, |limit| {
             counters.weighted_size + candidate_weight as u64 <= limit
         })
     }
 
     fn weights_to_evict(&self, counters: &EvictionCounters) -> u64 {
-        self.max_capacity
+        self.max_capacity.read()
             .map(|limit| counters.weighted_size.saturating_sub(limit))
             .unwrap_or_default()
     }
 
     #[inline]
     fn should_enable_frequency_sketch(&self, counters: &EvictionCounters) -> bool {
-        match self.max_capacity {
+        match *self.max_capacity.read() {
             None | Some(0) => false,
             Some(max_cap) => {
                 if self.frequency_sketch_enabled.load(Ordering::Acquire) {
@@ -1340,7 +1378,7 @@ where
 
     #[inline]
     fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
-        if let Some(max_cap) = self.max_capacity {
+        if let Some(max_cap) = *self.max_capacity.read() {
             let c = counters;
             let cap = if self.weigher.is_none() {
                 max_cap
@@ -1353,7 +1391,7 @@ where
 
     #[cfg(test)]
     fn enable_frequency_sketch_for_testing(&self) {
-        if let Some(max_cap) = self.max_capacity {
+        if let Some(max_cap) = *self.max_capacity.read() {
             self.do_enable_frequency_sketch(max_cap);
         }
     }
@@ -1363,6 +1401,41 @@ where
         let skt_capacity = common::sketch_capacity(cache_capacity);
         self.frequency_sketch.write().ensure_capacity(skt_capacity);
         self.frequency_sketch_enabled.store(true, Ordering::Release);
+    }
+
+    /// Updates the max capacity and adjusts the frequency sketch accordingly.
+    /// If the new capacity is less than the current weighted size, this will
+    /// trigger eviction by returning true.
+    fn update_max_capacity(&self, new_capacity: u64) -> bool {
+        let old_capacity = {
+            let mut cap = self.max_capacity.write();
+            let old = *cap;
+            *cap = Some(new_capacity);
+            old
+        };
+
+        // Adjust frequency sketch capacity
+        if new_capacity > 0 {
+            let skt_capacity = common::sketch_capacity(new_capacity);
+            self.frequency_sketch.write().ensure_capacity(skt_capacity);
+            
+            // Enable frequency sketch if not already enabled and we have enough entries
+            if !self.frequency_sketch_enabled.load(Ordering::Acquire) {
+                let weighted_size = self.weighted_size.load();
+                if weighted_size >= new_capacity / 2 {
+                    self.frequency_sketch_enabled.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        // Determine if we need to trigger eviction
+        if let Some(old) = old_capacity {
+            if new_capacity < old {
+                let current_size = self.weighted_size.load();
+                return current_size > new_capacity;
+            }
+        }
+        false
     }
 
     fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
@@ -1397,8 +1470,7 @@ where
     ) where
         V: Clone,
     {
-        use WriteOp::{Remove, Upsert};
-        let freq = self.frequency_sketch.read();
+        use WriteOp::{Remove, SetCapacity, Upsert};
         let ch = &self.write_op_ch;
 
         for _ in 0..count {
@@ -1409,17 +1481,20 @@ where
                     entry_gen: gen,
                     old_weight,
                     new_weight,
-                }) => self.handle_upsert(
-                    kh,
-                    entry,
-                    gen,
-                    old_weight,
-                    new_weight,
-                    deqs,
-                    timer_wheel,
-                    &freq,
-                    eviction_state,
-                ),
+                }) => {
+                    let freq = self.frequency_sketch.read();
+                    self.handle_upsert(
+                        kh,
+                        entry,
+                        gen,
+                        old_weight,
+                        new_weight,
+                        deqs,
+                        timer_wheel,
+                        &freq,
+                        eviction_state,
+                    );
+                }
                 Ok(Remove {
                     kv_entry: KvEntry { key: _key, entry },
                     entry_gen: gen,
@@ -1431,6 +1506,15 @@ where
                         Some(gen),
                         &mut eviction_state.counters,
                     );
+                }
+                Ok(SetCapacity { new_capacity }) => {
+                    // Update the capacity and check if eviction is needed
+                    let needs_eviction = self.update_max_capacity(new_capacity);
+                    
+                    // If eviction is needed, set the flag to trigger eviction
+                    if needs_eviction {
+                        eviction_state.more_entries_to_evict = true;
+                    }
                 }
                 Err(_) => break,
             };
@@ -1475,7 +1559,7 @@ where
             }
         }
 
-        if let Some(max) = self.max_capacity {
+        if let Some(max) = *self.max_capacity.read() {
             if new_weight as u64 > max {
                 // The candidate is too big to fit in the cache. Reject it.
 
